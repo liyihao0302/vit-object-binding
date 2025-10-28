@@ -1,0 +1,67 @@
+mode: 'train'
+seed: 0
+
+device: 'cuda:1' # inferring with dinov2 on this device
+
+trainer:
+  device: 'cuda:1' # training network on this device
+  batch_size: 256
+  max_epoch: 8
+  learning_rate: 1e-3
+  num_workers: 0 # dataloader num_workers
+  weight_decay: 0.01
+  scheduler:
+    step_size: 16
+    gamma: 0.2
+
+
+dataset:
+  name: 'ade20k'
+  data_dir: "/workspaces/003/data/datasets/ade20k/1/"
+  index: 10
+  train_ratio: 0.8
+  num_samples: 64 # how many samples of features to be extracted from one image
+
+  
+
+model:
+  num_layer: [6,12,18,23]
+  backbone_size: "large" # in ("small", "base", "large" or "giant")
+  model_dir: "/workspaces/003/data/dinov2/"
+  head_scale: 3
+  head_type: 'linear' #in ("ms, "linear")
+
+vis:
+  gif: True
+  mode: 'patch' #'object' 'patch' 'cls'
+  patch_y: 10
+  patch_x: 18
+  window_idx: 0
+  object_idx: 1
+  head: -1 #-1 for avg
+
+probe:
+  mode: 'quadratic' # diag_quadratic, quadratic, linear
+  in_dim: 1024
+  out_dim: 151
+
+seg:
+  class_weight: 2.0
+  mask_weight: 5.0
+  dice_weight: 5.0
+  num_queries: 100
+  
+  
+result_dir: "/workspaces/003/src/results/"
+#output_dir: ${hydra:runtime.cwd}/../../data/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}/
+output_dir: ${hydra:runtime.cwd}/../../data/outputs2/${probe.mode}_/layer_${model.num_layer[0]}_probe_${probe.mode}
+
+hydra:
+  run:
+    dir: ${output_dir}
+
+wandb:
+  entity: '...'
+  project_name: '...'
+  run_name: layer_${model.num_layer[0]}_probe_${probe.mode}
+  

@@ -1,0 +1,6 @@
+hydra-core
+matplotlib
+transformers
+wandb
+pandas
+ipdb
