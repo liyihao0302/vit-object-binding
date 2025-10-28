@@ -7,7 +7,7 @@ We show that large pretrained Vision Transformers (especially self-supervised on
 
 ## ⚙️ Installation
 
-We provide a single setup script that installs all dependencies (PyTorch, mmseg, DinoV2, xformers, etc.).
+We provide a single setup script that installs all dependencies (PyTorch, mmseg, DinoV2, xformers, etc.). During setup, `libs/dinov2/requirements.txt` is replaced with `requirements_dino.txt` so that the install uses the exact dependency versions tested in this repo.
 
 ```bash
 bash scripts/setup.sh
