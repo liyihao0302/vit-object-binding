@@ -1,7 +1,7 @@
 # 🧠 Does Object Binding Naturally Emerge in Large Pretrained Vision Transformers?
 **NeurIPS 2025 • Spotlight**
 
-📄 **Paper:** _link coming soon (arXiv / OpenReview)_  
+📄 **Paper:** [http://arxiv.org/abs/2510.24709](http://arxiv.org/abs/2510.24709)  
 
 We show that large pretrained Vision Transformers (especially self-supervised ones like DINOv2) naturally learn **object binding** — they internally represent whether two patches belong to the same object (IsSameObject) without any explicit object-level supervision.
 
