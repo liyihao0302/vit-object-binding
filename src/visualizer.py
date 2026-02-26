@@ -1,189 +1,319 @@
-import os
-import numpy as np
-
-import copy
-
+from utils.utils import set_random_seed
+from utils.datasets import ADE20KSegmentation, collate_fn
+from torch.utils.data import Subset, DataLoader
+from transformers import AutoModel, CLIPModel, ViTMAEForPreTraining
+from tqdm import tqdm
 import torch
-import torch.nn.functional as F
-import torch.nn as nn
-
-
-import dinov2.eval.segmentation.models
-import math
-import mmcv
-from mmcv.runner import load_checkpoint
-
-from PIL import Image
+import numpy as np
+import json
 import matplotlib.pyplot as plt
-
-import dinov2.eval.segmentation.utils.colormaps as colormaps
-
-from utils.transforms import inverse_transform, forward_transform, transform_masks_to_patches
-from utils.segment import create_segmenter, render_segmentation, inference_segmentor, load_config_from_url
-from utils.utils import set_random_seed, plot_attentions, plot_segmentation
-from utils.score import compute_attention, compute_issameobject
-from utils.dataset import ADE20KSegmentation
-from utils.models import get_model
+import h5py
+import torch.nn.functional as F
 import os
-os.environ["TORCH_HOME"] = "/workspaces/003/data/dinov2"
+import time
+import torchvision
+from torchvision.transforms import functional as TF
+import math
+from data_extractor import ImageProcessor
+from utils.models import get_model
+import cv2
+from utils.score import compute_batch_pairwise_similarity
+import matplotlib.patches as patches
+from skimage import measure
+from PIL import Image
+
+
 
 activations = {}
-class Visualizer():
+class Visualizer:
     def __init__(self, cfg, output_dir):
+        
         self.cfg = cfg
+
         set_random_seed(cfg.seed)
-        backbone_archs = {
-            "small": "vits14",
-            "base": "vitb14",
-            "large": "vitl14",
-            "giant": "vitg14",
-        }
-        backbone_arch = backbone_archs[cfg.model.backbone_size]
-        backbone_name = f"dinov2_{backbone_arch}"
-
-        self.backbone_model = torch.hub.load(repo_or_dir=cfg.model.model_dir, model=backbone_name, source = 'local')
-        self.backbone_model.eval()
-        self.backbone_model.to(self.cfg.device)
+        self.device = cfg.device
+        device = cfg.device
+        height, width = cfg.model.height, cfg.model.width
+        self.processor = ImageProcessor(cfg)
         
-
-        HEAD_SCALE_COUNT = cfg.model.head_scale# more scales: slower but better results, in (1,2,3,4,5)
-        HEAD_DATASET = cfg.dataset.name # in ("ade20k", "voc2012")
-        HEAD_TYPE = cfg.model.head_type # in ("ms, "linear")
-
-        DINOV2_BASE_URL = "https://dl.fbaipublicfiles.com/dinov2"
-        head_config_url = f"{DINOV2_BASE_URL}/{backbone_name}/{backbone_name}_{HEAD_DATASET}_{HEAD_TYPE}_config.py"
-        head_checkpoint_url = f"{DINOV2_BASE_URL}/{backbone_name}/{backbone_name}_{HEAD_DATASET}_{HEAD_TYPE}_head.pth"
-
-        cfg_str = load_config_from_url(head_config_url)
-        mmcfg = mmcv.Config.fromstring(cfg_str, file_format=".py")
-        #import pdb; pdb.set_trace()
-        self.mmcfg = mmcfg
-        if HEAD_TYPE == "ms":
-            mmcfg.data.test.pipeline[1]["img_ratios"] = mmcfg.data.test.pipeline[1]["img_ratios"][:HEAD_SCALE_COUNT]
-            print("scales:", cfg.data.test.pipeline[1]["img_ratios"])
-
-        self.model = create_segmenter(mmcfg, backbone_model=self.backbone_model)
-        load_checkpoint(self.model, head_checkpoint_url, map_location=self.cfg.device)
-        self.model.to(self.cfg.device)
+        if self.cfg.model.name == 'openai/clip-vit-large-patch14':
+            self.model = CLIPModel.from_pretrained(cfg.model.name, cache_dir=cfg.data_extractor.cache_dir).to(device)
+        elif self.cfg.model.name == 'facebook/vit-mae-large':
+            self.model = ViTMAEForPreTraining.from_pretrained('facebook/vit-mae-large', cache_dir=cfg.data_extractor.cache_dir).to(device)
+        else:
+            self.model = AutoModel.from_pretrained(cfg.model.name, cache_dir=cfg.data_extractor.cache_dir).to(device)
         self.model.eval()
-        
-        # Load the dataset
-        data_dir = self.cfg.dataset.data_dir
-        self.dataset = ADE20KSegmentation(root=data_dir, image_set="val", index=self.cfg.dataset.index)
+        if self.cfg.model.name == 'openai/clip-vit-large-patch14':
+            self.register_clip_hooks()
+            self.n_layers = self.model.vision_model.encoder.layers.__len__() # 24
+        elif self.cfg.model.name == 'facebook/vit-mae-large':
+            self.register_mae_hooks()
+            self.n_layers = self.model.vit.encoder.layer.__len__()
+        else:
+            self.register_hooks()
 
-        if self.cfg.mode == 'eval':
-            self.probes = []
-            for num_layer in self.cfg.model.num_layer:
-                checkpoint_dir =  f'/workspaces/003/src/../data/outputs2/{cfg.probe.mode}_/' + f'layer_{num_layer}_probe_{cfg.probe.mode}/'
-                CHECKPOINT_PATH = os.path.join(checkpoint_dir, 'best_checkpoint.pth')
-                probe = get_model(self.cfg)
-                checkpoint = torch.load(CHECKPOINT_PATH, map_location=self.cfg.device, weights_only=True)
-                probe.load_state_dict(checkpoint['model_state_dict'])
-                self.start_epoch = checkpoint['epoch']+1
-                self.best_val = checkpoint['best_val']
-                self.best_test = checkpoint['best_test']
-                probe.eval()
-                probe.to(self.cfg.device)
-                print("-> loaded checkpoint %s (epoch: %d)" % (CHECKPOINT_PATH, self.start_epoch))
-                self.probes.append(copy.deepcopy(probe))
+            self.n_layers = self.model.encoder.layer.__len__() # 24
+        
+        
 
-    def vis(self):
+    def extract(self, image_path):
+        img = cv2.imread(image_path)[:, :, ::-1].copy()  # Convert BGR to RGB
+        padded_img, patched_mask = self.processor.pad_and_return_patched_mask(img)
+        device = self.cfg.device
+        pixel_values = self.processor.forward(padded_img).permute(0,3,1,2).to(device) # "pixel_values": [N,3,518,518]
+        assert pixel_values.shape[0] == 1, "Batch size other than 1 not supported"
+        inputs = {"pixel_values": pixel_values}
+        if self.cfg.model.name == 'openai/clip-vit-large-patch14':
+            inputs['input_ids'] = torch.zeros(pixel_values.shape[0], 2, dtype=torch.long).to(device)
+            inputs['input_ids'][:,0] = 49406
+            inputs['input_ids'][:,1] = 49407
+            inputs['attention_mask'] = torch.ones(pixel_values.shape[0], 2, dtype=torch.long).to(device)
         
-        # Add hooks to layer
-        for num_layer, child in self.backbone_model.blocks.named_children():
-            if int(num_layer) in self.cfg.model.num_layer:
-                child.register_forward_hook(get_activations(num_layer))
-                num_heads = child.attn.num_heads
-        self.num_heads = num_heads
-        patch_size = self.backbone_model.patch_size
-        DATASET_COLORMAPS = {
-            "ade20k": colormaps.ADE20K_COLORMAP,
-            "voc2012": colormaps.VOC2012_COLORMAP,
-        }
-        image, mask, bbox = self.dataset[self.cfg.dataset.index]
-        
-        image = Image.open('/workspaces/003/src/results/example.png').convert('RGB')
-        array = np.array(image)[:, :, ::-1] # BGR
+        with torch.no_grad():
+            if self.cfg.model.name == 'facebook/vit-mae-large':
+                out = self.model(**inputs, output_hidden_states=True, return_dict=True)
+                mae_mask = out.mask
+                patched_seg_masks = apply_mae_mask(patched_seg_masks, mae_mask)
+                patched_instance_masks = apply_mae_mask(patched_instance_masks, mae_mask)
+                
+            else:
+                _ = self.model(**inputs) #['last_hidden_state' [B,1370,1024], 'pooler_output' [B,1024]]
+        self.processor.if_normalize = False
+        pixel_values = self.processor.forward(padded_img).permute(0,3,1,2).to(device) # "pixel_values": [N,3,518,518]
+        self.processor.if_normalize = True
+        # acitvations['0']: [1, n_patches, D]
+        return pixel_values[0], patched_mask
+            
+    def register_hooks(self):
         #import pdb; pdb.set_trace()
-        #mask = np.array(mask) #[366,500]
-        #mask[mask == 255] = 0 # Convert ignore regions to background
-        
-        segmentation_logits = inference_segmentor(self.model, array)[0]
-        colormap = DATASET_COLORMAPS[self.cfg.dataset.name]
-        segmented_image = render_segmentation(segmentation_logits, self.cfg.dataset.name, colormap)
-
-        #plot_segmentation(image, mask, segmented_image, self.cfg.result_dir+'image_voc.png')
-        
-
-        
-        attentions = []
-        for l_i, num_layer in enumerate(self.cfg.model.num_layer):
-            # Visualize object-level attention map
-            activation = activations[str(num_layer)] #[1, 1370, 1024]
-            attns = []
-            with torch.no_grad():
-                for idx, act in enumerate(activation):
-                    # we keep only the output patch attention
-
-                    if self.cfg.vis.mode == 'patch':
-                        patch_x, patch_y = self.cfg.vis.patch_x, self.cfg.vis.patch_y
-                        n = patch_y * int(math.sqrt(act.shape[1]-1)) + patch_x + 1
-                        if idx == self.cfg.vis.window_idx:
-                            # act[:, 1:] [1,1369, 1024]
-                            attn = compute_issameobject(self.probes[l_i], act[:,1:], n)
-                        else:
-                            attn = torch.zeros((1, act.shape[1]-1)).to(act.device)
-                    elif self.cfg.vis.mode == 'object':
-                        label = bbox[self.cfg.vis.object_idx]['class']
-                        xmin, ymin, xmax, ymax = bbox[self.cfg.vis.object_idx]['bbox']
-                        
-                        # {'class': 'person', 'bbox': (xmin=74, ymin=1, xmax=272, ymax=462)}
-                        bbox_mask = np.zeros_like(segmentation_logits)
-                        bbox_mask[ymin-1:ymax, xmin-1:xmax] = 1
-                        object_mask = np.where(segmentation_logits==label, 1, 0)
-                        object_mask = object_mask * bbox_mask
-                        masks = forward_transform(self.mmcfg.model.test_cfg.crop_size, self.mmcfg.model.test_cfg.stride, patch_size, object_mask)
-                        patches = transform_masks_to_patches(masks, patch_size)
-                        
-                        attn = torch.mean(compute_belonging(self.probe, act)[0, :, np.where(patches[idx].reshape(-1,1)>0.5)[0], 1:], dim=1)
-                        
-                    patch_length = int(math.sqrt(attn.shape[1]))
-                    attn = attn.reshape(attn.shape[0], patch_length, patch_length)
-                    attn = nn.functional.interpolate(attn.unsqueeze(0), scale_factor=patch_size, mode="bilinear")[0]
-                    attns.append(attn)
-
-            attention = inverse_transform(self.mmcfg.model.test_cfg.crop_size, self.mmcfg.model.test_cfg.stride, array.shape, attns)
-            if self.cfg.vis.head == -1:
-                attention = np.mean(attention, axis=0)
-            else:
-                attention = attention[self.cfg.vis.head]
-            attentions.append(attention)
-            if self.cfg.vis.gif==False:
-                break
-
-            if self.cfg.vis.mode == 'patch':
-                masks = []
-                for i in range(len(activation)):
-                    mask = torch.zeros((1, patch_length * patch_size, patch_length * patch_size))
-                    patch_x, patch_y = self.cfg.vis.patch_x, self.cfg.vis.patch_y
-                    if i == self.cfg.vis.window_idx:
-                        mask[:, patch_y * patch_size: (patch_y + 1) * patch_size, patch_x * patch_size: (patch_x + 1) * patch_size] = 1
-                    masks.append(mask)
-                transformed_mask = inverse_transform(self.mmcfg.model.test_cfg.crop_size, self.mmcfg.model.test_cfg.stride, array.shape, masks)
-
-            elif self.cfg.vis.mode == 'object':
-                transformed_mask = np.expand_dims(object_mask, axis=0)
-            else:
-                None
-        
-        i = self.cfg.vis.head if self.cfg.vis.head != -1 else 'avg'
-        plot_attentions(image, attentions, self.cfg.model.num_layer, self.cfg.vis, transformed_mask, self.cfg.result_dir+self.cfg.vis.mode+f'/attention_map_{i}', gif=self.cfg.vis.gif)
+        for num_layer, child in self.model.encoder.layer.named_children():
+            child.register_forward_hook(get_activations(num_layer))
     
+    def register_clip_hooks(self):
+        for num_layer, child in self.model.vision_model.encoder.layers.named_children():
+            child.register_forward_hook(get_activations(num_layer))
+            #num_heads = child.attn.num_heads
 
-#Extracting activations from the backbone
+    def register_mae_hooks(self):
+        for num_layer, child in self.model.vit.encoder.layer.named_children():
+            child.register_forward_hook(get_activations(num_layer))
+
+    def load_probe(self, layer):
+        self.probe = get_model(self.cfg).to(self.device)
+        print(self.probe)
+        probe_path = os.path.join(
+            "/workspaces/003/data/outputs_new_large/",
+            f"layer_{layer}_probe_{self.cfg.probe.mode}/",
+            'checkpoint.pth'
+        )
+        probe_state_dict = torch.load(probe_path, map_location='cpu')
+        self.probe.load_state_dict(probe_state_dict)
+        self.probe.eval()
+
+    def visualize(self, pixel_value, patched_mask, layer, patch_coor=(20,30)):
+        # pixel_value: [3, H, W]
+        self.load_probe(layer)
+        act = activations[str(layer)][:, 1:, :]  #[1, n_patches, D]
+
+        with torch.no_grad():
+            pairwise_similarity = compute_batch_pairwise_similarity(self.probe, act, act)
+            issameobject = F.sigmoid(pairwise_similarity)[0]  #[n_patches, n_patches]
+        patched_mask = patched_mask[0,:,:,0]
+        img_mask = self.processor.expand_patched_mask(patched_mask[None, :, :])[0]
+
+        H_image, W_image = infer_rect_hw(img_mask)
+        demo_img = pixel_value[:, img_mask == 1].reshape(3, H_image, W_image)
+
+
+        
+        patch_idx = patch_coor_to_patch_idx(patch_coor[0], patch_coor[1], patched_mask.shape[1])
+
+        pixel_issameobject = issameobject[patch_idx]
+        H_mask, W_mask = infer_rect_hw(patched_mask)
+        demo_issameobject = pixel_issameobject.reshape(patched_mask.shape)[patched_mask == 1].reshape(H_mask, W_mask)
+
+        
+        alpha = self.processor.expand_patched_mask(demo_issameobject.cpu())[0]
+        rgb = demo_img.permute(1,2,0).cpu().numpy()
+        rgb = np.clip(rgb, 0, 1)
+
+        fig, ax = plt.subplots(figsize=(10,10))
+
+        # RGB base image, with per-pixel alpha mask
+        ax.imshow(rgb, alpha=alpha)
+
+        # Draw the red bounding box
+        
+        seg_mask = alpha > 0.5
+        
+        self.draw_boundary(ax, seg_mask, color='black', linewidth=3)
+        self.draw_bounding_box(ax, patch_coor, patched_mask, color='red', linewidth=3)
+        # Save
+        ax.axis("off")
+        plt.savefig("img_overlay.png", bbox_inches="tight", dpi=300)
+
+        
+
+        return np.clip(rgb, 0, 1), patched_mask.numpy(), issameobject.cpu().numpy()
+
+
+        
+        
+        
+        
+    def get_bounding_box(self, patch_coor, patched_mask):
+        patch_idx = patch_coor_to_patch_idx(patch_coor[0], patch_coor[1], patched_mask.shape[1])
+        boundary_mask = np.zeros_like(patched_mask)
+        boundary_mask[patch_coor[0], patch_coor[1]] = 1
+        img_boundary_mask = self.processor.expand_patched_mask(boundary_mask[None, :, :])[0]
+        ys, xs = np.where(img_boundary_mask > 0)
+        y_min, y_max = ys.min(), ys.max()
+        x_min, x_max = xs.min(), xs.max()
+        return patch_idx, y_min, y_max, x_min, x_max
+
+    def draw_bounding_box(self, ax, patch_coor, patched_mask, color="red", linewidth=2):
+        patch_idx, y_min, y_max, x_min, x_max = self.get_bounding_box(patch_coor, patched_mask)
+        rect = patches.Rectangle((x_min, y_min), x_max - x_min + 1, y_max - y_min + 1, linewidth=linewidth, edgecolor=color, facecolor='none')
+        ax.add_patch(rect)
+    def draw_boundary(self, ax, seg_mask, color="red", linewidth=2):
+        """
+        Draw a continuous boundary line around regions in seg_mask.
+        seg_mask: (H, W) ints
+        """
+
+        labels = np.unique(seg_mask)
+        ys, xs = np.where(seg_mask != 0)
+
+        for label in labels:
+            if label == 0:
+                continue  # optional: skip background
+
+            # Binary mask for this label
+            region = (seg_mask == label).astype(float)
+
+            # Find contours at level=0.5
+            contours = measure.find_contours(region, 0.5)
+            
+            # Draw each contour as a line
+            for contour in contours:
+                
+                ax.plot(
+                    contour[:, 1],  # x
+                    contour[:, 0],  # y
+                    color=color,
+                    linewidth=linewidth
+                )
+
+
 def get_activations(name):
     def hook(model, input, output):
-        if activations.get(name) is None:
-            activations[name] = []
-        activations[name].append(output.detach())
+        if isinstance(output, tuple):
+            activations[name]=(output[0].detach()) #[B, 1370, 1024]
+        else:
+            activations[name]=(output.detach()) #[B, 1370, 1024]
     return hook
+
+
+
+
+def apply_mae_mask(patched_masks, mae_mask):
+
+    N = patched_masks.shape[0]
+
+    patch_flat = patched_masks.view(N, -1).to(mae_mask.device)
+    bool_mask = mae_mask.bool()
+    masked_vals = [
+        patch_flat[b][~bool_mask[b]] for b in range(N)
+    ]
+
+    patched_masks = torch.stack(masked_vals, dim=0)
+
+    return patched_masks
+
+def infer_rect_hw(img_mask):
+    """
+    img_mask: 2D numpy array with exactly one rectangular region of ones.
+    Returns (H_image, W_image, ymin, ymax, xmin, xmax)
+    """
+    ys, xs = np.where(img_mask == 1)
+
+    ymin, ymax = ys.min(), ys.max()
+    xmin, xmax = xs.min(), xs.max()
+
+    H_image = ymax - ymin + 1
+    W_image = xmax - xmin + 1
+
+    return H_image, W_image
+
+def patch_coor_to_patch_idx(y, x, n_patches_width):
+    """
+    y: patch y coordinate
+    x: patch x coordinate
+    n_patches_width: number of patches along width
+    """
+    return y * n_patches_width + x
+
+def save_rgb_image(img_array, path):
+    """
+    Save float RGB image to PNG.
+    - If range is [0,1], auto scale to [0,255]
+    - If range bigger than 1, just clip
+    """
+    arr = img_array.astype(np.float32)
+
+    # Auto-detect normalized images
+    if arr.max() <= 1.0:
+        arr = arr * 255.0
+
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    Image.fromarray(arr).save(path)
+
+
+def save_json(obj, path):
+    """Save JSON with indentation."""
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+
+def prepare_one_image(
+    output_dir,
+    rgb_image,
+    patched_mask,
+    issameobject_layers,
+    layer_ids,
+):
+    """
+    output_dir: directory (data/img1/)
+    rgb_image: np.array (H, W, 3) uint8
+    patched_mask: (37, 37) bool or 0/1
+    issameobject_layers: (num_layers, 1369, 1369) float
+    layer_ids: list of layer indices [0,3,6,...]
+    """
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    # --- 1. save RGB image ---
+    rgb_path = os.path.join(output_dir, "rgb_image.png")
+    save_rgb_image(rgb_image, rgb_path)
+    print(f"[Saved] {rgb_path}")
+
+    # --- 2. save patched_mask.json ---
+    patched_mask_list = patched_mask.astype(int).tolist()
+    mask_path = os.path.join(output_dir, "patched_mask.json")
+    save_json(patched_mask_list, mask_path)
+    print(f"[Saved] {mask_path}")
+
+    # --- 3. save issameobject.json (multi-layer) ---
+    issameobject_list = []
+
+    for li in range(len(layer_ids)):
+        m = issameobject_layers[li]  # [1369, 1369]
+        issameobject_list.append(m.tolist())
+
+    issame_data = {
+        "layers": layer_ids,
+        "issame": issameobject_list,
+    }
+
+    issame_path = os.path.join(output_dir, "issameobject.json")
+    save_json(issame_data, issame_path)
+    print(f"[Saved] {issame_path}")

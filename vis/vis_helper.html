@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <title>Does Object Binding Naturally Emerge in Large Pretrained Vision Transformers?</title>
+
+    <link rel="stylesheet" href="static/css/style.css">
+
+    <style>
+        body { font-family: Arial, sans-serif; margin: 30px; }
+        #container { display: flex; gap: 25px; margin-top: 25px; }
+        #left-panel, #right-panel { display: flex; flex-direction: column; gap: 12px; }
+        #canvas-original, #canvas-overlay, #canvas-colorbar {
+            border: 1px solid #aaa;
+        }
+        .controls-row { display: flex; align-items: center; gap: 12px; }
+        button { padding: 5px 10px; cursor: pointer; }
+
+        /* paper header */
+        #paper-header pre {
+            background: #f7f7f7;
+            padding: 12px;
+            border-radius: 6px;
+            font-size: 13px;
+            overflow-x: auto;
+        }
+    </style>
+    <script>
+    window.MathJax = {
+    tex: {
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']]
+    }
+    };
+    </script>
+    <script id="MathJax-script" async
+    src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js">
+    </script>
+
+</head>
+<body>
+
+<h2>Demo: <em>IsSameObject</em> extracted from xxxx using xxxx probes</h2>
+<p>
+
+    Click any patch on the left image to select it; the right panel then shows the
+    <em>IsSameObject</em> heatmap. Use the layer slider to explore transformer layers, and the arrow
+    buttons to switch images. The demo may take a few seconds to load.
+</p>
+<p></p>
+    [<strong>What does <em>IsSameObject</em> capture beyond attention or feature similarity? </strong>
+    It decodes what the model “knows” about which patches belong to the same object, more accurately than attention scores or feature similarity, by using a learned probe that projects activations into a binding subspace.
+    We later show that even visually identical objects can be distinguished, indicating that feature similarity alone cannot explain the binding signal.]
+</p>
+
+
+<div id="container">
+
+    <!-- LEFT PANEL -->
+    <div id="left-panel">
+        <canvas id="canvas-original"></canvas>
+
+        <div class="controls-row">
+            <button id="prev-image">◀</button>
+            <span id="image-label">Image 1 / 5</span>
+            <button id="next-image">▶</button>
+        </div>
+    </div>
+
+    <!-- RIGHT PANEL -->
+    <div id="right-panel">
+        <canvas id="canvas-overlay"></canvas>
+
+        <div class="controls-row">
+            <label for="layer-slider">Layer:</label>
+            <input type="range" id="layer-slider" min="0" max="8" step="1">
+            <span id="layer-label">18</span>
+        </div>
+    </div>
+
+    <!-- COLORBAR -->
+    <canvas id="canvas-colorbar"></canvas>
+
+</div>
+
+<script src="static/js/visualization.js"></script>
+
+
+
+
+</body>
+</html>

@@ -31,6 +31,17 @@ def compute_issameobject(probe, act, n):
     return scores.reshape(1, N)
 
 
+def compute_issameobject_all(probe, act):
+    
+    _, N, C = act.shape #[1, N, C]
+    
+    scores = probe.forward_pairwise(act.squeeze(0), act.squeeze(0)) #[N, 1]
+    #scores = F.sigmoid(scores)
+    #import pdb; pdb.set_trace()
+    #scores = (scores>0.5).float()
+    return scores
+
+
 class InfoNCELossWithLabels(nn.Module):
     def __init__(self, temperature=0.5):
         """
@@ -134,6 +145,30 @@ def sigmoid_ce_loss(
 
     return loss.mean(1).sum() / num_masks
 
+def weighted_bce_loss(logits, targets, pos_weight=1.0, neg_weight=0.1):
+    """
+    Computes the weighted binary cross-entropy (BCE) loss.
+
+    Args:
+        logits (torch.Tensor): Predicted logits (before sigmoid).
+        targets (torch.Tensor): Ground truth labels (0 or 1).
+        pos_weight (float): Weight for the positive class (object).
+        neg_weight (float): Weight for the negative class (no_object).
+
+    Returns:
+        torch.Tensor: Weighted BCE loss.
+    """
+    # Convert logits to probabilities
+    probs = torch.sigmoid(logits)
+
+    # Compute weighted BCE loss
+    loss = - (
+        pos_weight * targets * torch.log(probs + 1e-8) + 
+        neg_weight * (1 - targets) * torch.log(1 - probs + 1e-8)
+    )
+
+    return loss.mean()
+
 def batch_dice_loss(inputs: torch.Tensor, targets: torch.Tensor):
     """
     Compute the DICE loss, similar to generalized IOU for masks
@@ -189,9 +224,10 @@ batch_dice_loss_jit = torch.jit.script(
 class InstanceSegmentationLoss():
     def __init__(self, cfg):
         
-        self.class_weight = cfg.seg.class_weight
-        self.mask_weight = cfg.seg.mask_weight
-        self.dice_weight = cfg.seg.dice_weight
+        self.class_weight = cfg.class_weight
+        self.mask_weight = cfg.mask_weight
+        self.dice_weight = cfg.dice_weight
+        self.no_object_weight = cfg.no_object_weight
 
     def __call__(self, inputs, targets):
         '''
@@ -203,17 +239,21 @@ class InstanceSegmentationLoss():
         inputs: [B, n_queries, n_points]
         targets: list[n_targets, n_points]
         '''
+        import pdb; pdb.set_trace()
         targets = self.process_targets(targets)
+        import pdb; pdb.set_trace()
         B = inputs.shape[0]
         inputs = inputs.permute(0, 2, 1)
         num_masks = B
         losses = 0.0
-        num_masks = sum([target.shape[0] for target in targets])
+        num_masks = sum([target.shape[0]-1 for target in targets])
         for b in range(B):
+            
             pred_indices, tgt_indices = self.hungarian_matching(inputs[b], targets[b])
 
-            loss = self.mask_weight * sigmoid_ce_loss(inputs[b][pred_indices], targets[b][tgt_indices], num_masks) + \
-                self.dice_weight * dice_loss(inputs[b][pred_indices], targets[b][tgt_indices], num_masks)
+            loss = self.class_weight * weighted_bce_loss(inputs[b][0], 1-targets[b][0], 1.0, self.no_object_weight)/B + \
+                self.mask_weight * sigmoid_ce_loss(inputs[b][1:][pred_indices], targets[b][1:][tgt_indices], num_masks) + \
+                self.dice_weight * dice_loss(inputs[b][1:][pred_indices], targets[b][1:][tgt_indices], num_masks)
             
             losses += loss
             
@@ -225,7 +265,7 @@ class InstanceSegmentationLoss():
         targets: [B, n_points]  (each value represents an instance ID, 0 is background)
         
         Returns:
-        target_list: List of tensors, each with shape [n_targets, n_points] where n_targets is unique foreground instances.
+        target_list: List of tensors, each with shape [n_targets+1, n_points] where n_targets is unique foreground instances.
         '''
         target_list = []
         
@@ -234,10 +274,10 @@ class InstanceSegmentationLoss():
             unique_labels = unique_labels[unique_labels > 0]  # Exclude background (0)
 
             # Create one-hot encoding for the instance masks
-            one_hot_mask = torch.zeros((len(unique_labels), targets.shape[1]), dtype=torch.float32, device=targets.device)
-
+            one_hot_mask = torch.zeros((len(unique_labels)+1, targets.shape[1]), dtype=torch.float32, device=targets.device)
+            one_hot_mask[0] = (targets[b] == 0).float()  # Assign 1 where the instance is background
             for i, label in enumerate(unique_labels):
-                one_hot_mask[i] = (targets[b] == label).float()  # Assign 1 where the instance matches
+                one_hot_mask[i+1] = (targets[b] == label).float()  # Assign 1 where the instance matches
             
             target_list.append(one_hot_mask)
 
@@ -247,22 +287,22 @@ class InstanceSegmentationLoss():
     def hungarian_matching(self, out_mask, tgt_mask):
 
         '''
-        out_mask [num_queries, n_points]
-        tgt_mask [num_targets, n_points]
+        out_mask [num_queries+1, n_points]
+        tgt_mask [num_targets+1, n_points]
         '''
-        num_queries = out_mask.shape[0]
+        num_queries = out_mask.shape[0]-1
         with autocast(enabled=False):
             out_mask = out_mask.float()
             tgt_mask = tgt_mask.float()
+
             # Compute the focal loss between masks
-            cost_mask = batch_sigmoid_ce_loss_jit(out_mask, tgt_mask)
+            cost_mask = batch_sigmoid_ce_loss_jit(out_mask[1:], tgt_mask[1:])
 
             # Compute the dice loss betwen masks
-            cost_dice = batch_dice_loss_jit(out_mask, tgt_mask)
+            cost_dice = batch_dice_loss_jit(out_mask[1:], tgt_mask[1:])
         
         # Final cost matrix
-        C = (
-            self.mask_weight * cost_mask
+        C = (self.mask_weight * cost_mask
             + self.dice_weight * cost_dice
         )
         C = C.reshape(num_queries, -1).cpu().detach().numpy()

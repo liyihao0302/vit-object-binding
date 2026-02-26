@@ -1,7 +1,0 @@
-
-omegaconf
-torchmetrics
-fvcore
-iopath
-xformers==0.0.23.post1
-submitit

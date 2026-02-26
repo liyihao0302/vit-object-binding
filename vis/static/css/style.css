@@ -1,0 +1,10 @@
+#container {
+    display: flex;
+    align-items: flex-start;
+    gap: 15px;
+}
+
+#canvas-colorbar {
+    display: block;
+    margin-top: 20px;
+}
