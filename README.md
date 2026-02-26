@@ -72,7 +72,7 @@ These models confirm that quadratic probes capture *IsSameObject* structure beyo
 
 ## 👀 Visualization
 
-To visualize **layer-wise IsSameObject scores**, we provide an interactive HTML viewer, since the scores are of size \(n_{\text{patches}} \times n_{\text{patches}}\).
+To visualize **layer-wise IsSameObject scores**, we provide an interactive HTML viewer to effectively visualize the *IsSameObject* scores of size (n_patches × n_patches).
 
 First, run `main.py` with `output_dir` set to the saved probe checkpoint to prepare the data for visualization:
 ```bash
